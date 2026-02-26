@@ -201,7 +201,9 @@ export default class PlatformHubBase {
       await uploadFunction(data, markFunction);
     } catch (error) {
       log.error(`Error in ${this.config.platformName} upload:`, error);
-      Toast.raiseToast(`${this.config.platformName} 업로드 중 오류가 발생했습니다.`);
+      const message =
+        error instanceof Error ? error.message : `${this.config.platformName} 업로드 중 오류가 발생했습니다.`;
+      Toast.raiseToast(message);
     }
   }
 

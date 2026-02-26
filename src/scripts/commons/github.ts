@@ -22,6 +22,25 @@ function getAuthHeaders(token: string): Record<string, string> {
   };
 }
 
+/** Throw with user-friendly message on API error (e.g. 403 org access) */
+async function checkResponseAndThrow(response: Response, context: string): Promise<void> {
+  if (response.ok) return;
+  const body = await response.text();
+  let message: string;
+  try {
+    const json = JSON.parse(body) as { message?: string };
+    message = json.message || body || `${response.status} ${response.statusText}`;
+  } catch {
+    message = body || `${response.status} ${response.statusText}`;
+  }
+  if (response.status === 403) {
+    throw new Error(
+      `${context}: ${message}. 조직 저장소인 경우, 조직 관리자에게 OAuth 앱 승인을 요청하세요. (조직 설정 → Third-party access)`
+    );
+  }
+  throw new Error(`${context}: ${message}`);
+}
+
 /**
  * Get a repo's default branch
  * @see https://docs.github.com/en/rest/reference/repos
@@ -33,6 +52,7 @@ export async function getDefaultBranchOnRepo(hook: string, token: string): Promi
     headers: getAuthHeaders(token),
   });
   log.debug("getDefaultBranchOnRepo response:", response);
+  await checkResponseAndThrow(response, "저장소 접근 실패");
   const data = (await response.json()) as GitHubRepository;
   log.debug("getDefaultBranchOnRepo data:", data);
   return data.default_branch;
@@ -113,9 +133,52 @@ export async function createOrUpdateFile(
     body: JSON.stringify(body),
   });
   log.debug("createOrUpdateFile response:", response);
+  await checkResponseAndThrow(response, "파일 업로드 실패");
   const data = (await response.json()) as GitHubFileContent;
   log.debug("createOrUpdateFile data:", data);
   return data;
+}
+
+/**
+ * Create a repository in an organization
+ * @see https://docs.github.com/en/rest/repos/repos#create-an-organization-repository
+ */
+export async function createOrgRepository(
+  org: string,
+  name: string,
+  token: string,
+  options: { private?: boolean; description?: string } = {}
+): Promise<{ full_name: string }> {
+  log.info("createOrgRepository called with org:", org, "name:", name);
+
+  const response = await fetch(`https://api.github.com/orgs/${org}/repos`, {
+    method: "POST",
+    headers: {
+      ...getAuthHeaders(token),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name,
+      private: options.private ?? true,
+      description: options.description ?? "PS solutions - BaekjoonHub",
+      auto_init: true,
+    }),
+  });
+
+  await checkResponseAndThrow(response, "조직 저장소 생성 실패");
+  const data = (await response.json()) as { full_name: string };
+  return data;
+}
+
+/**
+ * Check if a repository exists
+ */
+export async function repoExists(hook: string, token: string): Promise<boolean> {
+  const response = await fetch(`${urls.GITHUB_API_REPOS_URL}/${hook}`, {
+    method: "GET",
+    headers: getAuthHeaders(token),
+  });
+  return response.ok;
 }
 
 /**

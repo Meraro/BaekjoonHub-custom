@@ -5,6 +5,7 @@
 import { getObjectFromLocalStorage, saveObjectInLocalStorage } from "./scripts/commons/storage";
 import { STORAGE_KEYS } from "./scripts/constants/registry";
 import beginOAuth2 from "./scripts/commons/oauth2";
+import { createOrgRepository, repoExists } from "./scripts/commons/github";
 import { parseTemplateString, TextTransforms as SafeTextTransforms } from "safe-template-parser";
 import { getTextTransforms } from "./scripts/commons/text-transforms";
 import log from "./scripts/commons/logger";
@@ -28,6 +29,10 @@ interface GitHubRepository {
   fullName: string;
   description: string | null;
   private: boolean;
+  /** Owner login (username or org name). Used to show org label. */
+  ownerLogin?: string;
+  /** True if repository belongs to an organization (not user's personal). */
+  isOrgRepo?: boolean;
 }
 
 interface GitHubUserInfo {
@@ -359,47 +364,121 @@ function updateFormValues(): void {
   }
 }
 
+const GITHUB_API_HEADERS = (token: string) => ({
+  Authorization: `token ${token}`,
+  Accept: "application/vnd.github.v3+json",
+});
+
+interface GitHubApiRepo {
+  name: string;
+  full_name: string;
+  description: string | null;
+  private: boolean;
+  owner?: { login: string; type?: string };
+}
+
+function toRepo(repo: GitHubApiRepo, isOrgRepo: boolean): GitHubRepository {
+  return {
+    name: repo.name,
+    fullName: repo.full_name,
+    description: repo.description,
+    private: repo.private,
+    ownerLogin: repo.owner?.login,
+    isOrgRepo,
+  };
+}
+
+interface FetchUserInfoResult {
+  userInfo: GitHubUserInfo | null;
+  errorMessage?: string;
+}
+
 /**
- * Fetch GitHub user info and repositories
+ * Fetch GitHub user info and repositories (including organization repos)
  */
-async function fetchGitHubUserInfo(): Promise<GitHubUserInfo | null> {
+async function fetchGitHubUserInfo(): Promise<FetchUserInfoResult> {
   try {
     const data = await getObjectFromLocalStorage<Record<string, unknown>>([STORAGE_KEYS.TOKEN, STORAGE_KEYS.USERNAME]);
     const token = data?.[STORAGE_KEYS.TOKEN] as string | undefined;
     const username = data?.[STORAGE_KEYS.USERNAME] as string | undefined;
 
     if (!token || !username) {
-      return null;
+      return { userInfo: null };
     }
 
     githubUserInfo.username = username;
 
-    const response = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated", {
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: "application/vnd.github.v3+json",
-      },
-    });
+    const repoMap = new Map<string, GitHubRepository>();
 
-    if (response.ok) {
-      const repos = await response.json();
-      githubUserInfo.repositories = repos.map((repo: {
-        name: string;
-        full_name: string;
-        description: string | null;
-        private: boolean;
-      }) => ({
-        name: repo.name,
-        fullName: repo.full_name,
-        description: repo.description,
-        private: repo.private,
-      }));
+    // 1. Fetch user repos (personal + org repos user has access to)
+    const userReposResponse = await fetch(
+      "https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member",
+      { headers: GITHUB_API_HEADERS(token) }
+    );
+
+    if (userReposResponse.status === 403) {
+      return {
+        userInfo: null,
+        errorMessage:
+          "조직 저장소에 접근할 수 없습니다. 조직 관리자에게 OAuth 앱 승인을 요청하세요. (조직 설정 → Third-party access)",
+      };
     }
 
-    return githubUserInfo;
+    if (userReposResponse.ok) {
+      const userRepos = (await userReposResponse.json()) as GitHubApiRepo[];
+      for (const repo of userRepos) {
+        const isOrg = repo.owner?.type === "Organization";
+        repoMap.set(repo.full_name, toRepo(repo, isOrg));
+      }
+    }
+
+    // 2. Fetch organization repos (in case some are missing from user/repos)
+    const orgsResponse = await fetch("https://api.github.com/user/orgs", {
+      headers: GITHUB_API_HEADERS(token),
+    });
+
+    if (orgsResponse.status === 403) {
+      return {
+        userInfo: null,
+        errorMessage:
+          "조직 목록을 가져올 수 없습니다. 조직 관리자에게 OAuth 앱 승인을 요청하세요. (조직 설정 → Third-party access)",
+      };
+    }
+
+    if (orgsResponse.ok) {
+      const orgs = (await orgsResponse.json()) as { login: string }[];
+      for (const org of orgs) {
+        try {
+          const orgReposResponse = await fetch(
+            `https://api.github.com/orgs/${org.login}/repos?per_page=100&sort=updated`,
+            { headers: GITHUB_API_HEADERS(token) }
+          );
+          if (orgReposResponse.status === 403) {
+            log.warn(`Org ${org.login}: OAuth app not approved for this organization`);
+            continue;
+          }
+          if (orgReposResponse.ok) {
+            const orgRepos = (await orgReposResponse.json()) as GitHubApiRepo[];
+            for (const repo of orgRepos) {
+              if (!repoMap.has(repo.full_name)) {
+                repoMap.set(repo.full_name, toRepo(repo, true));
+              }
+            }
+          }
+        } catch (orgError) {
+          log.warn(`Failed to fetch repos for org ${org.login}:`, orgError);
+        }
+      }
+    }
+
+    githubUserInfo.repositories = Array.from(repoMap.values()).sort((a, b) =>
+      a.fullName.localeCompare(b.fullName)
+    );
+
+    return { userInfo: githubUserInfo };
   } catch (error) {
     log.error("GitHub user info fetch error:", error);
-    return null;
+    return { userInfo: null };
   }
 }
 
@@ -414,11 +493,12 @@ function updateRepositorySelect(): void {
     elements.repoSelect.removeChild(elements.repoSelect.lastChild!);
   }
 
-  // Add new options
+  // Add new options (personal and org repos with labels)
   githubUserInfo.repositories.forEach((repo) => {
     const option = document.createElement("option");
     option.value = repo.fullName;
-    option.textContent = `${repo.name} ${repo.private ? "(비공개)" : ""}`;
+    const orgLabel = repo.isOrgRepo && repo.ownerLogin ? ` (${repo.ownerLogin})` : "";
+    option.textContent = `${repo.name}${orgLabel} ${repo.private ? "(비공개)" : ""}`;
     if (repo.description) {
       option.textContent += ` - ${repo.description}`;
     }
@@ -438,7 +518,7 @@ async function handleRepoTypeChange(): Promise<void> {
     if (elements.repoName) elements.repoName.style.display = "block";
     if (elements.repoSelect) elements.repoSelect.style.display = "none";
 
-    const userInfo = await fetchGitHubUserInfo();
+    const { userInfo } = await fetchGitHubUserInfo();
     if (elements.repoName) {
       elements.repoName.value = userInfo?.username ? `${userInfo.username}/TIL` : "username/TIL";
     }
@@ -453,11 +533,14 @@ async function handleRepoTypeChange(): Promise<void> {
     if (elements.repoName) elements.repoName.style.display = "none";
     if (elements.repoSelect) elements.repoSelect.style.display = "block";
 
-    const userInfo = await fetchGitHubUserInfo();
+    const { userInfo, errorMessage } = await fetchGitHubUserInfo();
     if (userInfo) {
       updateRepositorySelect();
     } else {
-      showMessage("error", "GitHub 사용자 정보를 가져올 수 없습니다. 다시 로그인해 주세요.");
+      showMessage(
+        "error",
+        errorMessage || "GitHub 사용자 정보를 가져올 수 없습니다. 다시 로그인해 주세요."
+      );
     }
   } else {
     if (elements.repoName) {
@@ -537,6 +620,42 @@ async function handleRepoConnection(): Promise<void> {
     hideMessage("error");
     elements.connectRepo.disabled = true;
     elements.connectRepo.textContent = "연결 중...";
+
+    // When creating new repo in org: create it if it doesn't exist
+    const [owner, repoNamePart] = repoName.split("/");
+    if (owner && repoNamePart) {
+      const exists = await repoExists(repoName, token);
+      if (!exists) {
+        const storageData = await getObjectFromLocalStorage<Record<string, unknown>>([STORAGE_KEYS.USERNAME]);
+        const username = storageData?.[STORAGE_KEYS.USERNAME] as string | undefined;
+        const isOrgRepo = !!username && owner !== username;
+        if (isOrgRepo) {
+          try {
+            elements.connectRepo.textContent = "저장소 생성 중...";
+            await createOrgRepository(owner, repoNamePart, token);
+            showMessage("success", "조직 저장소가 생성되었습니다.");
+          } catch (createError) {
+            log.error("Org repo creation error:", createError);
+            const msg =
+              createError instanceof Error
+                ? createError.message
+                : "저장소 생성에 실패했습니다. 조직 내 생성 권한이 있는지 확인하세요.";
+            showMessage("error", msg);
+            elements.connectRepo.disabled = false;
+            elements.connectRepo.textContent = "연결하기";
+            return;
+          }
+        } else {
+          showMessage(
+            "error",
+            "저장소가 존재하지 않습니다. GitHub에서 먼저 저장소를 생성해 주세요."
+          );
+          elements.connectRepo.disabled = false;
+          elements.connectRepo.textContent = "연결하기";
+          return;
+        }
+      }
+    }
 
     await saveObjectInLocalStorage({
       [STORAGE_KEYS.MODE_TYPE]: "commit",

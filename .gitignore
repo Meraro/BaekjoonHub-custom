@@ -1,3 +1,7 @@
+# Environment (OAuth credentials)
+.env
+.env.local
+
 # Dependencies
 node_modules/
 

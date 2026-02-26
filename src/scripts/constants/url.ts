@@ -1,13 +1,19 @@
 /**
  * URL constants for BaekjoonHub
+ * OAuth credentials can be overridden via environment variables for custom deployments (e.g. organization study groups).
+ * Set VITE_GITHUB_CLIENT_ID and VITE_GITHUB_CLIENT_SECRET when building.
  */
 
 const urls = {
   GITHUB_AUTHORIZATION_URL: "https://github.com/login/oauth/authorize",
   GITHUB_ACCESS_TOKEN_URL: "https://github.com/login/oauth/access_token",
   GITHUB_REDIRECT_URL: "https://github.com/",
-  GITHUB_CLIENT_ID: "975f8d5cf6686dd1faed",
-  GITHUB_CLIENT_SECRET: "934b2bfc3bb3ad239bc67bdfa81a378b1616dd1e",
+  GITHUB_CLIENT_ID:
+    (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_GITHUB_CLIENT_ID ||
+    "975f8d5cf6686dd1faed",
+  GITHUB_CLIENT_SECRET:
+    (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_GITHUB_CLIENT_SECRET ||
+    "934b2bfc3bb3ad239bc67bdfa81a378b1616dd1e",
   GITHUB_API_USER_URL: "https://api.github.com/user",
   GITHUB_API_REPOS_URL: "https://api.github.com/repos",
   SOLVED_AC_API_PROBLEM_SHOW_URL: "https://solved.ac/api/v3/problem/show?problemId=",
